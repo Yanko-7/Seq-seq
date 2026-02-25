@@ -1,0 +1,11 @@
+# 🚀 TODO (VQ-VAE + DPO)
+
+- [ ] Tokenizer: 加载并冻结 VQ-VAE 权重 (src/tokenizer.py)
+- [ ] Pack Data: 多进程打包全量数据为连续 .bin 文件 (scripts/pack_dataset.py)
+- [ ] DataLoader: 实现基于 Memmap 的零拷贝切片读取 (src/datamodule.py)
+- [ ] Model: 从 LitGPT 提取 GPT, Block, CausalSelfAttention 等算子 (src/model.py)
+- [ ] Train: 基于 Fabric 封装 FSDP + bf16-mixed + torch.compile (train.py)
+- [ ] Sampler: 实现带 KV Cache 的极速自回归采样与解码 (src/sampler.py)
+- [ ] Callbacks: 定时生成几何样本并打标到 WandB (src/callbacks.py)
+- [ ] DPO Loss: 手写对数概率计算与 DPO 目标函数 (src/dpo_loss.py)
+- [ ] DPO Train: 同时加载 Policy 与 Reference 模型跑通对齐训练 (train_dpo.py)

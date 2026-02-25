@@ -1,0 +1,69 @@
+/checkpoints
+# Data and Weights
+data/
+datasets/
+*.zip
+*.tar.gz
+*.7z
+
+# Model checkpoints and weights
+checkpoint/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.weights
+*.onnx
+*.pb
+
+# Training logs
+logs/
+runs/
+*.tfevents.*
+mlruns/
+wandb/
+.tensorboard-logs/
+
+# Python environment
+venv/
+.venv/
+env/
+bin/
+lib/
+share/
+include/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*-checkpoint.ipynb
+
+# IDEs
+.vscode/
+.idea/
+.project
+.pydevproject
+
+# Neovim / Vim
+*.swp
+*.swo
+Session.vim
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CUDA/Compilation
+*.so
+*.out
+build/
+dist/
+*.egg-info/
+samples/
