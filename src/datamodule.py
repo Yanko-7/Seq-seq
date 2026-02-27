@@ -1,96 +1,108 @@
 import torch
-import numpy as np
 import lightning as L
-from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
+from torch.utils.data import DataLoader
+from torch.utils.data import IterableDataset
+import random
+import litdata as ld
+from src.tokenizer import BRepTokenType
 
 
-class MemmapTokenDataset(Dataset):
-    """
-    极致性能的 Dataset：直接将硬盘上的二进制 Token 映射到虚拟内存。
-    依靠操作系统的 Page Cache 机制，实现零拷贝（Zero-copy）级别的数据读取。
-    """
-
-    def __init__(self, memmap_path: str | Path, block_size: int):
-        super().__init__()
-        self.block_size = block_size
-
-        # 假设你在 pack_dataset.py 中保存的是 uint16 格式以节省硬盘
-        # mode='r' 表示只读，保证多进程下的安全
-        self.data = np.memmap(memmap_path, dtype=np.uint16, mode="r")
-        self.total_tokens = len(self.data)
-
-        # 虚拟的 Epoch 长度：在海量数据预训练中，通常不需要严格遍历一遍
-        # 这里定义每个 Epoch 采样 100,000 个 Batch
-        self.epoch_length = 100_000
-
-    def __len__(self):
-        return self.epoch_length
-
-    def __getitem__(self, _):
-        # 1. 随机跳跃读取（Random Seek），避免顺序读取时的 Epoch 边界问题
-        # block_size + 1 是因为我们需要同时切出输入(x)和目标(y)
-        start_idx = torch.randint(
-            0, self.total_tokens - self.block_size - 1, (1,)
-        ).item()
-
-        # 2. 从内存映射中切片 (极其快速的 O(1) 操作)
-        chunk = self.data[start_idx : start_idx + self.block_size + 1]
-
-        # 3. 转换为 PyTorch 张量，并转为 int64 (Embedding 层只认 int64)
-        chunk_tensor = torch.from_numpy(chunk.astype(np.int64))
-
-        # 4. 错位构造自回归的 X 和 Y
-        x = chunk_tensor[:-1]  # 取前 N 个
-        y = chunk_tensor[1:]  # 取后 N 个 (右移一位的预测目标)
-
-        return x, y
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 
-class FastTokenDataModule(L.LightningDataModule):
-    """
-    Lightning 的标准数据管家，负责管理多进程 DataLoader
-    """
+class PackedDataset(IterableDataset):
+    def __init__(self, input_dir: str, max_num_tokens: int, buffer_size: int = 10000):
+        self.stream_ds = ld.StreamingDataset(input_dir=input_dir)
+        self.max_num_tokens = max_num_tokens
+        self.buffer_size = buffer_size
 
+    def __iter__(self):
+        stream_iter = iter(self.stream_ds)
+
+        doc_buffer = []
+        tokens = []
+        current_len = 0
+        max_num_docs = next_multiple_of_n(
+            self.max_num_tokens // 1000, n=128
+        )  # median doc length is ~1000
+
+        while True:
+            try:
+                while len(doc_buffer) < self.buffer_size:
+                    doc_buffer.append(next(stream_iter))
+            except StopIteration:
+                pass
+            if not doc_buffer:
+                break
+
+            random.shuffle(doc_buffer)
+
+            while doc_buffer:
+                item = doc_buffer.pop()
+                tokens.append(item)
+                current_len += len(item)
+                if current_len >= self.max_num_tokens:
+                    merged = torch.cat(tokens)[: self.max_num_tokens]
+                    cum_lengths = torch.nonzero(merged == BRepTokenType.BOS)[:, 0]
+                    _cum_lengths = torch.full((max_num_docs,), self.max_num_tokens)
+                    actual_docs = len(cum_lengths)
+                    safe_docs = min(actual_docs, max_num_docs - 1)
+                    _cum_lengths[:safe_docs] = cum_lengths[:safe_docs]
+                    yield (merged, _cum_lengths, self.max_num_tokens, actual_docs)
+                    tokens = []
+                    current_len = 0
+
+
+def custom_packed_collate_fn(batch):
+    input_ids, cu_seqlens, max_seq_len, sample_nums = batch[0]
+    return (input_ids.unsqueeze(0), cu_seqlens.unsqueeze(0), max_seq_len, sample_nums)
+
+
+class PackedDataModule(L.LightningDataModule):
     def __init__(
         self,
-        data_dir: str,
-        block_size: int = 2048,
-        batch_size: int = 64,
-        num_workers: int = 8,
+        train_dir: str,
+        val_dir: str = None,
+        max_num_tokens: int = 16384,
+        batch_size: int = 1,
+        num_workers: int = 16,
+        buffer_size: int = 10000,
     ):
         super().__init__()
-        self.data_dir = Path(data_dir)
-        self.block_size = block_size
-        self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.save_hyperparameters()
 
     def setup(self, stage: str = None):
-        # Setup 会在每张 GPU (每个进程) 上被调用一次
-        # 我们在这里指向之前跑好的离线 .bin / .memmap 文件
-        train_path = self.data_dir / "train_tokens.bin"
-        val_path = self.data_dir / "val_tokens.bin"
-
-        if stage == "fit" or stage is None:
-            self.train_dataset = MemmapTokenDataset(train_path, self.block_size)
-            self.val_dataset = MemmapTokenDataset(val_path, self.block_size)
+        self.train_ds = PackedDataset(
+            input_dir=self.hparams.train_dir,
+            max_num_tokens=self.hparams.max_num_tokens,
+            buffer_size=self.hparams.buffer_size,
+        )
+        if self.hparams.val_dir:
+            self.val_ds = PackedDataset(
+                input_dir=self.hparams.val_dir,
+                max_num_tokens=self.hparams.max_num_tokens,
+                buffer_size=self.hparams.buffer_size // 2,
+            )
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,  # 极其重要：将数据锁在页锁定内存中，加速 CPU 到 GPU 的传输
-            shuffle=False,  # 因为在 Dataset 里已经是随机取样了，这里就不需要 shuffle 了
-            drop_last=True,  # 丢弃不完整的 batch，防止硬件对齐惩罚
+            self.train_ds,
+            batch_size=self.hparams.batch_size,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=custom_packed_collate_fn,
         )
 
     def val_dataloader(self):
+        if not self.hparams.val_dir:
+            return None
         return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
+            self.val_ds,
+            batch_size=self.hparams.batch_size,
+            num_workers=max(1, self.hparams.num_workers // 2),
             pin_memory=True,
-            shuffle=False,
-            drop_last=True,
+            drop_last=False,
+            collate_fn=custom_packed_collate_fn,
         )

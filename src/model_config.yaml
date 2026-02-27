@@ -1,0 +1,20 @@
+name: "forge-trace"
+block_size: 65536
+padded_vocab_size: 4096
+vocab_size: 4096
+padding_multiple: 64
+n_layer: 16
+n_head: 16
+n_embd: 1024
+n_query_groups: 4  # GQA组数 (K/V头数为4)
+rotary_percentage: 1.0
+parallel_residual: false
+bias: false
+norm_class_name: "RMSNorm"
+mlp_class_name: "LLaMAMLP"  #  SwiGLU
+intermediate_size: 2816
+norm_eps: 1.0e-6
+rope_base: 1000000
+norm_qk: true
+
+# packed_max_num_tokens: 24576

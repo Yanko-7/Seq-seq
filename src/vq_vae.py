@@ -1107,7 +1107,7 @@ class SurfaceFSQVAE(LightningModule):
     def encode(
         self,
         x: torch.FloatTensor,
-    ) -> torch.FloatTensor:
+    ):
         """
         Args:
             x (`torch.FloatTensor`): Input sample.
