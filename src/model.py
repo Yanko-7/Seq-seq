@@ -29,7 +29,7 @@ class ForgeTrace(L.LightningModule):
         super().__init__()
         self.model = GPT(config)
         self.save_hyperparameters()
-        self.model.apply(self.model._init_weights)
+        self.config = config
 
     def on_train_start(self):
         initialize_weights(
@@ -40,21 +40,27 @@ class ForgeTrace(L.LightningModule):
         )
 
     def training_step(self, batch):
-        input_ids, cu_seqlens, max_seq_len, sample_nums = batch
-        mask = create_flex_packed_mask(cu_seqlens, max_seq_len)
-        logits = self.model(input_ids, mask=mask)
+        # input_ids, cu_seqlens = batch
+        input_ids = batch["input_ids"]
+        cu_seqlens = batch["cu_seqlens"]
+        max_seq_len = batch["max_seq_len"]
+        # mask = create_flex_packed_mask(cu_seqlens[0], 32768)
+        # logits = self.model(input_ids, mask=mask)
+        logits = self.model(input_ids, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
         self.log("train_loss", loss, prog_bar=True, batch_size=1)
-        self.log("sample_nums", sample_nums, prog_bar=True, batch_size=1)
-
         return loss
 
     def validation_step(self, batch):
-        input_ids, cu_seqlens, max_seq_len, sample_nums = batch
-        mask = create_flex_packed_mask(cu_seqlens, max_seq_len)
-        logits = self.model(input_ids, mask=mask)
+        # input_ids, cu_seqlens = batch
+        input_ids = batch["input_ids"]
+        cu_seqlens = batch["cu_seqlens"]
+        max_seq_len = batch["max_seq_len"]
+        # mask = create_flex_packed_mask(cu_seqlens[0], 32768)
+        # logits = self.model(input_ids, mask=mask)
+        logits = self.model(input_ids, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=1)
+        self.log("val_loss", loss, batch_size=1)
         return loss
 
     def configure_optimizers(self):
@@ -77,12 +83,16 @@ class ForgeTrace(L.LightningModule):
             dict(
                 params=adam_params,
                 use_muon=False,
-                lr=3e-4,
+                lr=4e-4,
                 betas=(0.9, 0.95),
                 weight_decay=0.01,
             ),
         ]
+
         optimizer = MuonWithAuxAdam(param_groups)
+        # optimizer = torch.optim.AdamW(
+        #     self.model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
+        # )
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, lambda step: min(step / warmup_steps, 1.0)
         )

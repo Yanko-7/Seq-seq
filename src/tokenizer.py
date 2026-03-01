@@ -542,6 +542,8 @@ class Tokenizer:
             norm_pts, bbox = normalize_points_with_bbox(pts)
             edge_norms.append(norm_pts)
             edge_bboxes.append(bbox)
+        if len(face_norms) == 0 or len(edge_norms) == 0:
+            raise ValueError("Face points or edge points are empty, cannot encode.")
 
         with torch.no_grad():
             # Note: Adjust .encode() depending on your exact LightningModule signature

@@ -16,5 +16,4 @@ intermediate_size: 2816
 norm_eps: 1.0e-6
 rope_base: 1000000
 norm_qk: true
-
-# packed_max_num_tokens: 24576
+attention_dropout: 0.1

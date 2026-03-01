@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing_extensions import Self
 
-from litgpt.config import Config
+from src.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 from torch.nn.attention.flex_attention import (
     BlockMask,
@@ -23,7 +23,6 @@ from torch.nn.attention.flex_attention import (
 )
 from flash_attn import flash_attn_interface
 
-_compiled_flex_attention = torch.compile(flex_attention)
 _MaskType = Union[torch.Tensor, BlockMask]
 
 
@@ -42,7 +41,7 @@ class GPT(nn.Module):
                 h=nn.ModuleList(
                     Block(config, block_idx) for block_idx in range(config.n_layer)
                 ),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                ln_f=RMSNorm(config.n_embd, eps=config.norm_eps),
             )
         )
         self.mask_cache: Optional[torch.Tensor] = None
@@ -95,8 +94,8 @@ class GPT(nn.Module):
     def forward(
         self,
         idx: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seq_len: int,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = 0,
         mask: Optional[_MaskType] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
@@ -144,7 +143,6 @@ class GPT(nn.Module):
             cos = batched_index_select(self.cos, 0, input_pos)
             sin = batched_index_select(self.sin, 0, input_pos)
         else:
-            # 普通不打包的训练，位置 ID 顺序递增
             cos = self.cos[:T].unsqueeze(0)
             sin = self.sin[:T].unsqueeze(0)
 
@@ -162,18 +160,17 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
-        for block_idx, block in enumerate(self.transformer.h):
-            if self.config.rope_indices is not None:
-                x = block(
-                    x,
-                    cos[..., self.config.rope_indices[block_idx]],
-                    sin[..., self.config.rope_indices[block_idx]],
-                    mask,
-                    input_pos,
-                    input_pos_maxp1,
-                )
-            else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        for _, block in enumerate(self.transformer.h):
+            x = block(
+                x,
+                cos,
+                sin,
+                cu_seqlens,
+                max_seq_len,
+                mask,
+                input_pos,
+                input_pos_maxp1,
+            )
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -339,8 +336,8 @@ class Block(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seq_len: int,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = 0,
         mask: Optional[_MaskType] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
@@ -368,7 +365,14 @@ class Block(nn.Module):
 
         x_normed = self.norm_1(x)
         attention_output = self.attn(
-            x_normed, cos, sin, mask, input_pos, input_pos_maxp1
+            x_normed,
+            cos,
+            sin,
+            cu_seqlens,
+            max_seq_len,
+            mask,
+            input_pos,
+            input_pos_maxp1,
         )
         attention_output = self.post_attention_norm(attention_output)
 
@@ -387,9 +391,10 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
         # key, query and value projections for all heads, but in a batch
+        self.attention_dropout = config.attention_dropout
         self.qkv = nn.Linear(
             config.n_embd,
-            (config.n_head + 2 * config.n_query_groups)
+            (2 * config.n_head + 2 * config.n_query_groups)
             * config.head_size,  # support for grouped/multi queries
             bias=config.bias or config.attn_bias,
         )
@@ -409,18 +414,8 @@ class CausalSelfAttention(nn.Module):
             ]
 
         if config.norm_qk:
-            norm_q_size = (
-                config.n_head * config.head_size
-                if config.norm_qk_type == "olmo2"
-                else config.head_size
-            )
-            norm_k_size = (
-                config.n_query_groups * config.head_size
-                if config.norm_qk_type == "olmo2"
-                else config.head_size
-            )
-            self.norm_q = config.norm_class(norm_q_size, eps=config.norm_eps)
-            self.norm_k = config.norm_class(norm_k_size, eps=config.norm_eps)
+            self.norm_q = RMSNorm(config.head_size, eps=config.norm_eps)
+            self.norm_k = RMSNorm(config.head_size, eps=config.norm_eps)
         else:
             self.norm_q = self.norm_k = None
 
@@ -432,8 +427,8 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seq_len: int,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = 0,
         mask: Optional[_MaskType] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
@@ -473,18 +468,16 @@ class CausalSelfAttention(nn.Module):
 
         # Perform a single multiplication operation using a combined QKV matrix to calculate `query`, `key`, and `value`
         # instead of individually multiplying the input `x` with the respective weight matrices.
-        qkv = self.qkv(x)  # (B, T, 3xC*)
+        qkv = self.qkv(x)  # (B, T, 4xC*)
 
         # Define query, key and value sizes.
         # If grouped/multi query is enabled, these sizes are not equal (see the diagram above).
         query_size = n_head * head_size
         key_size = value_size = n_query_groups * head_size
         # Split qkv into query, key and value matrices.
-        q, k, v = qkv.split((query_size, key_size, value_size), dim=-1)  # 3x(B, T, C*)
-
-        if self.config.norm_qk and self.config.norm_qk_type == "olmo2":
-            q = self.norm_q(q)
-            k = self.norm_k(k)
+        gate, q, k, v = qkv.split(
+            (query_size, query_size, key_size, value_size), dim=-1
+        )  # 4x(B, T, C*)
 
         # To place the num_heads (nh) dimension right after the batch (B) dimension, the first step is to decouple the
         # embedding size (C) into num_heads (nh) and head_size (hs).
@@ -495,22 +488,15 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, n_query_groups, head_size)  # (B, T, n_query_groups, hs)
         v = v.view(B, T, n_query_groups, head_size)  # (B, T, n_query_groups, hs)
 
-        # The tensors `query`, `key`, and `value` are now accurately structured: within each batch element (B), there are
-        # multiple heads (nh), and within each head, there is a sequence of elements (T), each represented by a vector
-        # of size `hs`.
-        q = q.transpose(1, 2)  # (B, nh_q, T, hs)
-        k = k.transpose(1, 2)  # (B, nh_k, T, hs)
-        v = v.transpose(1, 2)  # (B, nh_v, T, hs)
-
-        if self.config.norm_qk and self.config.norm_qk_type == "default":
+        if self.config.norm_qk:
             q = self.norm_q(q)
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
         q_roped = apply_rope(q[..., :rope_n_elem], cos, sin)
         k_roped = apply_rope(k[..., :rope_n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
-        k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
+        q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, T, nh_q, hs)
+        k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, T, nh_k, hs)
 
         # Apply kv-cache during inference.
         if input_pos is not None:
@@ -530,29 +516,36 @@ class CausalSelfAttention(nn.Module):
             # k, v: (B, nh_k, input_pos_maxp1, hs)
             # If input_pos_maxp1 is None -> max_seq_length
 
-        if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
-            q_per_kv = n_head // n_query_groups
-            k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-            v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
+        if mask is None and self.kv_cache is None:  # Packed train
+            ############################# Flash Attention  #############################
+            y = flash_attn_interface.flash_attn_varlen_func(
+                q[0],
+                k[0],
+                v[0],
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seq_len,
+                max_seqlen_k=max_seq_len,
+                causal=True,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+            )
 
-        y = flash_attn_interface.flash_attn_varlen_func(
-            q[0],
-            k[0],
-            v[0],
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seq_len,
-            max_seqlen_k=max_seq_len,
-            causal=True,
-            # softmax_scale=yarn.attn_scale,
-            # window_size=(bm_size, 0),
-        )
-        # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        # y = self.scaled_dot_product_attention(q, k, v, mask)
+        else:  # Batch inference
+            # # The tensors `query`, `key`, and `value` are now accurately structured: within each batch element (B), there are
+            # # multiple heads (nh), and within each head, there is a sequence of elements (T), each represented by a vector
+            # # of size `hs`.
+            q = q.transpose(1, 2)  # (B, nh_q, T, hs)
+            k = k.transpose(1, 2)  # (B, nh_k, T, hs)
+            v = v.transpose(1, 2)  # (B, nh_v, T, hs)
+            ############################# Flex Attention  #############################
+            if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
+                q_per_kv = n_head // n_query_groups
+                k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
+                v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
+            # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
+            y = self.scaled_dot_product_attention(q, k, v, mask)
 
-        # Re-assemble all head outputs side by side.
-        y = y.reshape(B, T, head_size * n_head)
-
+        y = y.reshape(B, T, head_size * n_head).contiguous() * torch.sigmoid(gate)
         # Output projection.
         return self.proj(y)  # (B, T, C)
 
@@ -574,17 +567,14 @@ class CausalSelfAttention(nn.Module):
                     # flex_attention 已经默认除了 sqrt(head_size)，这里直接做 tanh 截断
                     return softcap_thresh * torch.tanh(score / softcap_thresh)
 
-                y = _compiled_flex_attention(
+                y = flex_attention(
                     q, k, v, block_mask=mask, enable_gqa=True, score_mod=softcap_mod
                 )
             else:
-                y = _compiled_flex_attention(q, k, v, enable_gqa=True, block_mask=mask)
+                y = flex_attention(q, k, v, enable_gqa=True, block_mask=mask)
 
             return y.transpose(1, 2)
 
-        # ==========================================
-        # 2. 推理/普通分支：使用 SDPA 或手动计算 (原有逻辑)
-        # ==========================================
         scale = 1.0 / math.sqrt(
             self.config.attention_scores_scalar or self.config.head_size
         )
@@ -675,6 +665,20 @@ class CausalSelfAttention(nn.Module):
                 )
 
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def reset_parameters(self) -> None:
+        qkv_std = math.sqrt(2.0 / 5.0 / self.config.n_embd)
+        nn.init.normal_(self.qkv.weight, mean=0.0, std=qkv_std)
+        if self.qkv.bias is not None:
+            nn.init.zeros_(self.qkv.bias)
+        proj_std = 1.0 / math.sqrt(self.config.n_embd) / self.config.n_layer
+        nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        if self.norm_q is not None:
+            nn.init.ones_(self.norm_q.weight)
+        if self.norm_k is not None:
+            nn.init.ones_(self.norm_k.weight)
 
 
 class LLaMAMLP(nn.Module):
@@ -844,18 +848,24 @@ def batched_index_copy_(t, dim, idx, val):
         return t
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 2,  # 默认为 2 (即在 T 和 head_size 之间插入 N)
+) -> torch.Tensor:
     """
-    Applies RoPE transform to `x`. Note that `cos`, `sin` need to have a batch
-    dimension.
+    Applies RoPE transform to `x`.
 
     Args:
-        x: Input tensor, `(B, ..., T, head_size)`
-        cos: Cached cosines, `(B, T, head_size)` or `(1, T, head_size)`
-        sin: Cached sines, `(B, T, head_size)` or `(1, T, head_size)`
+        x: Input tensor.
+        cos: Cached cosines, shape `(B, T, head_size)` or `(1, T, head_size)`
+        sin: Cached sines, shape `(B, T, head_size)` or `(1, T, head_size)`
+        unsqueeze_dim: The dimension index to insert a size-1 dimension for broadcasting
+                       the attention heads.
 
     Returns:
-        Encoded tensor, `(B, ..., T, head_size)`
+        Encoded tensor with the same shape as `x`.
     """
     if cos.dim() != 3:
         raise ValueError(f"cos must be three-dimensional, but shape is {cos.shape}")
@@ -863,16 +873,14 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
         raise ValueError(
             f"cos, sin must have same shape, but cos.shape={cos.shape}, sin.shape={sin.shape}"
         )
+
     head_size_half = x.size(-1) // 2
-    x1 = x[..., :head_size_half]  # (B, ..., T, head_size/2)
-    x2 = x[..., head_size_half:]  # (B, ..., T, head_size/2)
-    rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, head_size)
-    dims_diff = x.dim() - cos.dim()
-    if dims_diff > 0:
-        # Ensure that shapes of `x`, `cos`, `sin` align
-        new_shape = cos.shape[0:1] + (1,) * dims_diff + cos.shape[1:]
-        cos = cos.view(*new_shape)
-        sin = sin.view(*new_shape)
+    x1 = x[..., :head_size_half]
+    x2 = x[..., head_size_half:]
+    rotated = torch.cat((-x2, x1), dim=-1)
+
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
 
     roped = (x * cos) + (rotated * sin)
     return roped.to(dtype=x.dtype)

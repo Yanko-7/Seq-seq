@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 # import zstandard as zstd
-from litdata import optimize, TokensLoader
+from litdata import optimize
 from functools import partial
 import numpy as np
 import sys
@@ -23,7 +23,15 @@ def tokenize_fn(file_path, tokenizer, augment=True):
         inner_edge_indices = npz_data["inner_edge_indices"]
         inner_loop_offsets = npz_data["inner_loop_offsets"]
         face_inner_offsets = npz_data["face_inner_offsets"]
-
+    if (
+        len(face_points) == 0
+        or len(edge_points) == 0
+        or len(edge_adjacency) == 0
+        or len(outer_edge_indices) == 0
+        or len(face_outer_offsets) == 0
+    ):
+        print(f"Warning: Empty data in file {file_path}, skipping.")
+        return
     num_augments = 8
 
     if augment:
@@ -66,16 +74,22 @@ def tokenize_fn(file_path, tokenizer, augment=True):
                 inner_loop_offsets,
                 face_inner_offsets,
             )
-            input_ids = tokenizer.encode(
-                face_points=aug_face_points,
-                edge_points=aug_edge_points,
-                outer_edge_indices=new_outer_edge_indices,
-                face_outer_offsets=new_face_outer_offsets,
-                inner_edge_indices=new_inner_edge_indices,
-                inner_loop_offsets=new_inner_loop_offsets,
-                face_inner_offsets=new_face_inner_offsets,
-                device="cuda",
-            )
+            try:
+                input_ids = tokenizer.encode(
+                    face_points=aug_face_points,
+                    edge_points=aug_edge_points,
+                    outer_edge_indices=new_outer_edge_indices,
+                    face_outer_offsets=new_face_outer_offsets,
+                    inner_edge_indices=new_inner_edge_indices,
+                    inner_loop_offsets=new_inner_loop_offsets,
+                    face_inner_offsets=new_face_inner_offsets,
+                    device="cuda",
+                )
+            except Exception as e:
+                print(
+                    f"Error encoding file {file_path} with rotation index {rot_idx}: {e}"
+                )
+                continue
             yield input_ids
     else:
         (
@@ -94,16 +108,20 @@ def tokenize_fn(file_path, tokenizer, augment=True):
             inner_loop_offsets,
             face_inner_offsets,
         )
-        input_ids = tokenizer.encode(
-            face_points=face_points,
-            edge_points=edge_points,
-            outer_edge_indices=new_outer_edge_indices,
-            face_outer_offsets=new_face_outer_offsets,
-            inner_edge_indices=new_inner_edge_indices,
-            inner_loop_offsets=new_inner_loop_offsets,
-            face_inner_offsets=new_face_inner_offsets,
-            device="cuda",
-        )
+        try:
+            input_ids = tokenizer.encode(
+                face_points=face_points,
+                edge_points=edge_points,
+                outer_edge_indices=new_outer_edge_indices,
+                face_outer_offsets=new_face_outer_offsets,
+                inner_edge_indices=new_inner_edge_indices,
+                inner_loop_offsets=new_inner_loop_offsets,
+                face_inner_offsets=new_face_inner_offsets,
+                device="cuda",
+            )
+        except Exception as e:
+            print(f"Error encoding file {file_path}: {e}")
+            return
         yield input_ids
 
 
@@ -133,7 +151,7 @@ if __name__ == "__main__":
         json_path="abc_filtered_final.json",
         root_dir="/cache/yanko/datasets/npz_files/organized_by_face_count/",
     )
-    inputs = [str(file) for file in dataset["val"]]
+    inputs = [str(file) for file in dataset["train"]]
     checkpoint_dir = "../weights"
     _tokenizer = Tokenizer(checkpoint_dir)
     # 3. Store the optimized data wherever you want under "/teamspace/datasets" or "/teamspace/s3_connections"
@@ -141,8 +159,8 @@ if __name__ == "__main__":
     outputs = optimize(
         fn=partial(tokenize_fn, tokenizer=_tokenizer, augment=True),
         inputs=inputs,
-        output_dir="./abc-optimized-sep-val",
-        chunk_size=2048,
+        output_dir="./abc-optimized-sep-train",
+        chunk_size=4096 * 8,
         # item_loader=TokensLoader(),
         num_workers=16,
     )
