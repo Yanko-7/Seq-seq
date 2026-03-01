@@ -304,7 +304,10 @@ class MuonAdamW(torch.optim.Optimizer):
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        if closure is not None:
+            with torch.enable_grad():
+                closure()
         for group in self.param_groups:
             if group["kind"] == "adamw":
                 self._step_adamw(group)

@@ -1,9 +1,7 @@
 import torch
-from litgpt.utils import chunked_cross_entropy
-from litgpt.pretrain import initialize_weights
 import lightning as L
-from src.gptv2 import GPT
-from muon import MuonWithAuxAdam
+from src.gptv3 import GPT
+from litgpt.utils import chunked_cross_entropy
 from torch.nn.attention.flex_attention import (
     create_block_mask,
 )
@@ -32,67 +30,35 @@ class ForgeTrace(L.LightningModule):
         self.config = config
 
     def on_train_start(self):
-        initialize_weights(
-            self.trainer,
-            self.model,
-            n_layer=self.model.config.n_layer,
-            n_embd=self.model.config.n_embd,
-        )
+        self.model.init_weights()
 
     def training_step(self, batch):
-        # input_ids, cu_seqlens = batch
         input_ids = batch["input_ids"]
         cu_seqlens = batch["cu_seqlens"]
         max_seq_len = batch["max_seq_len"]
-        # mask = create_flex_packed_mask(cu_seqlens[0], 32768)
-        # logits = self.model(input_ids, mask=mask)
-        logits = self.model(input_ids, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
+        logits = self.model(
+            input_ids, mask=None, cu_seqlens=cu_seqlens, max_seqlen=max_seq_len
+        )
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
         self.log("train_loss", loss, prog_bar=True, batch_size=1)
         return loss
 
     def validation_step(self, batch):
-        # input_ids, cu_seqlens = batch
         input_ids = batch["input_ids"]
         cu_seqlens = batch["cu_seqlens"]
         max_seq_len = batch["max_seq_len"]
-        # mask = create_flex_packed_mask(cu_seqlens[0], 32768)
-        # logits = self.model(input_ids, mask=mask)
-        logits = self.model(input_ids, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
+        logits = self.model(
+            input_ids, mask=None, cu_seqlens=cu_seqlens, max_seqlen=max_seq_len
+        )
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
-        self.log("val_loss", loss, batch_size=1)
+        self.log(
+            "val_loss", loss, prog_bar=True, batch_size=1, on_step=True, on_epoch=False
+        )
         return loss
 
     def configure_optimizers(self):
         warmup_steps = 500
-        muon_params = []
-        adam_params = []
-
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            if "wte" in name or "lm_head" in name:
-                adam_params.append(p)
-            elif p.ndim >= 2:
-                muon_params.append(p)
-            else:
-                adam_params.append(p)
-
-        param_groups = [
-            dict(params=muon_params, use_muon=True, lr=0.024, weight_decay=0.01),
-            dict(
-                params=adam_params,
-                use_muon=False,
-                lr=4e-4,
-                betas=(0.9, 0.95),
-                weight_decay=0.01,
-            ),
-        ]
-
-        optimizer = MuonWithAuxAdam(param_groups)
-        # optimizer = torch.optim.AdamW(
-        #     self.model.parameters(), lr=4e-4, weight_decay=0.1, betas=(0.9, 0.95)
-        # )
+        optimizer = self.model.setup_optimizer()
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, lambda step: min(step / warmup_steps, 1.0)
         )

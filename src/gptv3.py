@@ -100,7 +100,7 @@ class CausalSelfAttention(nn.Module):
             gate = 2 * torch.sigmoid(
                 self.ve_gate(x[..., : self.ve_gate_channels])
             )  # (B, T, n_kv_head), range (0, 2)
-            v = v + gate.unsqueeze(-1) * ve
+            v = v + (gate.unsqueeze(-1) * ve).to(v.dtype)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin

@@ -108,17 +108,17 @@ class PackedDataModule(L.LightningDataModule):
             collate_fn=custom_packed_collate_fn,
         )
 
-    # def val_dataloader(self):
-    #     if not self.hparams.val_dir:
-    #         return None
-    #     return DataLoader(
-    #         self.val_ds,
-    #         batch_size=self.hparams.batch_size,
-    #         num_workers=max(1, self.hparams.num_workers),
-    #         pin_memory=True,
-    #         drop_last=True,
-    #         # collate_fn=custom_packed_collate_fn,
-    #     )
+    def val_dataloader(self):
+        if not self.hparams.val_dir:
+            return None
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.hparams.batch_size,
+            num_workers=max(1, self.hparams.num_workers),
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=custom_packed_collate_fn,
+        )
 
 
 from itertools import chain
