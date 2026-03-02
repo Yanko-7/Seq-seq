@@ -7,28 +7,32 @@ from torch.utils.data import IterableDataset
 import random
 import litdata as ld
 from src.tokenizer import BRepTokenType
+from itertools import chain
 
 
-def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+def next_multiple_of_n(v: float | int, *, n: int) -> int:
+    return ((int(v) + n - 1) // n) * n
 
 
 class PackedDataset(IterableDataset):
-    def __init__(self, input_dir: str, max_num_tokens: int, buffer_size: int = 10000):
-        self.stream_ds = ld.StreamingDataset(input_dir=input_dir)
+    def __init__(
+        self,
+        input_dir: str,
+        max_num_tokens: int,
+        buffer_size: int = 10000,
+        shuffle: bool = True,
+    ):
+        self.stream_ds = ld.StreamingDataset(input_dir=input_dir, shuffle=shuffle)
         self.max_num_tokens = max_num_tokens
         self.buffer_size = buffer_size
+        self.max_num_docs = next_multiple_of_n(self.max_num_tokens // 1000, n=128)
 
-    def __iter__(self):
+    def _iter_once(self):
+        """Iterate through the StreamingDataset once, yielding packed batches."""
         stream_iter = iter(self.stream_ds)
-
         doc_buffer = []
         tokens = []
         current_len = 0
-        max_num_docs = next_multiple_of_n(
-            self.max_num_tokens // 1000, n=128
-        )  # median doc length is ~1000
-
         while True:
             try:
                 while len(doc_buffer) < self.buffer_size:
@@ -48,10 +52,10 @@ class PackedDataset(IterableDataset):
                     merged = torch.cat(tokens)[: self.max_num_tokens]
                     cum_lengths = torch.nonzero(merged == BRepTokenType.BOS)[:, 0]
                     _cum_lengths = torch.full(
-                        (max_num_docs,), self.max_num_tokens, dtype=torch.int32
+                        (self.max_num_docs,), self.max_num_tokens, dtype=torch.int32
                     )
                     actual_docs = len(cum_lengths)
-                    safe_docs = min(actual_docs, max_num_docs - 1)
+                    safe_docs = min(actual_docs, self.max_num_docs - 1)
                     _cum_lengths[:safe_docs] = cum_lengths[:safe_docs]
                     max_seq_len = int(torch.diff(_cum_lengths).max().item())
                     yield (
@@ -61,6 +65,10 @@ class PackedDataset(IterableDataset):
                     )
                     tokens = []
                     current_len = 0
+
+    def __iter__(self):
+        while True:
+            yield from self._iter_once()
 
 
 def custom_packed_collate_fn(batch):
@@ -90,12 +98,14 @@ class PackedDataModule(L.LightningDataModule):
             input_dir=self.hparams.train_dir,
             max_num_tokens=self.hparams.max_num_tokens,
             buffer_size=self.hparams.buffer_size,
+            shuffle=True,
         )
         if self.hparams.val_dir:
             self.val_ds = PackedDataset(
                 input_dir=self.hparams.val_dir,
                 max_num_tokens=self.hparams.max_num_tokens,
                 buffer_size=self.hparams.buffer_size,
+                shuffle=False,
             )
 
     def train_dataloader(self):
@@ -104,7 +114,6 @@ class PackedDataModule(L.LightningDataModule):
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
             pin_memory=True,
-            drop_last=True,
             collate_fn=custom_packed_collate_fn,
         )
 
@@ -114,14 +123,11 @@ class PackedDataModule(L.LightningDataModule):
         return DataLoader(
             self.val_ds,
             batch_size=self.hparams.batch_size,
-            num_workers=max(1, self.hparams.num_workers),
+            num_workers=max(1, self.hparams.num_workers / 2),
             pin_memory=True,
-            drop_last=True,
             collate_fn=custom_packed_collate_fn,
         )
 
-
-from itertools import chain
 
 if __name__ == "__main__":
     max_num_tokens = 32768

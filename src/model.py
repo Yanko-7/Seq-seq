@@ -1,25 +1,9 @@
+import math
+
 import torch
 import lightning as L
 from src.gptv3 import GPT
 from litgpt.utils import chunked_cross_entropy
-from torch.nn.attention.flex_attention import (
-    create_block_mask,
-)
-
-
-def create_flex_packed_mask(cu_seqlens: torch.Tensor, max_seq_len: int):
-    cu_seqlens = torch.atleast_2d(cu_seqlens)
-    pos = torch.arange(max_seq_len, device=cu_seqlens.device)
-    doc_ids = torch.stack(
-        [torch.bucketize(pos, seq[1:], right=False) for seq in cu_seqlens]
-    )
-
-    def mask_mod(b, h, q, kv):
-        return (q >= kv) & (doc_ids[b, q] == doc_ids[b, kv])
-
-    return create_block_mask(
-        mask_mod, B=1, H=None, Q_LEN=max_seq_len, KV_LEN=max_seq_len, _compile=True
-    )
 
 
 class ForgeTrace(L.LightningModule):
@@ -27,10 +11,8 @@ class ForgeTrace(L.LightningModule):
         super().__init__()
         self.model = GPT(config)
         self.save_hyperparameters()
-        self.config = config
-
-    def on_train_start(self):
         self.model.init_weights()
+        self.config = config
 
     def training_step(self, batch):
         input_ids = batch["input_ids"]
@@ -40,7 +22,7 @@ class ForgeTrace(L.LightningModule):
             input_ids, mask=None, cu_seqlens=cu_seqlens, max_seqlen=max_seq_len
         )
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
-        self.log("train_loss", loss, prog_bar=True, batch_size=1)
+        self.log("train/loss", loss, prog_bar=True, batch_size=1)
         return loss
 
     def validation_step(self, batch):
@@ -51,18 +33,39 @@ class ForgeTrace(L.LightningModule):
             input_ids, mask=None, cu_seqlens=cu_seqlens, max_seqlen=max_seq_len
         )
         loss = chunked_cross_entropy(logits[..., :-1, :], input_ids[..., 1:])
-        self.log(
-            "val_loss", loss, prog_bar=True, batch_size=1, on_step=True, on_epoch=False
-        )
+        self.log("val/loss", loss, prog_bar=True, batch_size=1, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
-        warmup_steps = 500
-        optimizer = self.model.setup_optimizer()
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda step: min(step / warmup_steps, 1.0)
+        self.num_iters = 200000
+        optimizer = self.model.setup_optimizer(
+            unembedding_lr=0.002,
+            embedding_lr=0.1,
+            matrix_lr=0.01,
+            scalar_lr=0.1,
+            weight_decay=0.1,
         )
+
+        def lr_lambda(step):
+            if step < 2000:
+                return (step + 1) / 2000
+            progress = min(1.0, (step - 2000) / (self.num_iters - 2000))
+            return 0.1 + 0.45 * (1.0 + math.cos(math.pi * progress))
+
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            "lr_scheduler": {
+                "scheduler": torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda),
+                "interval": "step",
+            },
         }
+
+    def on_before_optimizer_step(self, optimizer):
+        step = self.global_step
+        muon_momentum = 0.95 - 0.1 * max(0.0, 1.0 - step / 500.0)
+        current_wd = 0.1 * max(0.0, 1.0 - step / self.num_iters)
+
+        for group in optimizer.param_groups:
+            if group.get("kind") == "muon":
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = current_wd

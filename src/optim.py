@@ -36,18 +36,25 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
-    # Weight decay (decoupled, applied before the update)
-    p.mul_(1 - lr_t * wd_t)
-    # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    # Bias corrections
-    bias1 = 1 - beta1_t**step_t
-    bias2 = 1 - beta2_t**step_t
-    # Compute update and apply
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    device, dtype = p.device, p.dtype
+    step = step_t.to(device=device, dtype=dtype)
+    lr = lr_t.to(device=device, dtype=dtype)
+    beta1 = beta1_t.to(device=device, dtype=dtype)
+    beta2 = beta2_t.to(device=device, dtype=dtype)
+    eps = eps_t.to(device=device, dtype=dtype)
+    wd = wd_t.to(device=device, dtype=dtype)
+
+    p.mul_(1 - lr * wd)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+
+    bias1_val = 1 - beta1**step
+    bias2_val = 1 - beta2**step
+
+    denom = (exp_avg_sq / bias2_val).sqrt() + eps
+    step_size = lr / bias1_val
+
+    p.sub_((exp_avg / denom) * step_size)
 
 
 # -----------------------------------------------------------------------------
@@ -305,9 +312,10 @@ class MuonAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        loss = None
         if closure is not None:
             with torch.enable_grad():
-                closure()
+                loss = closure()
         for group in self.param_groups:
             if group["kind"] == "adamw":
                 self._step_adamw(group)
@@ -315,6 +323,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+        return loss
 
 
 # -----------------------------------------------------------------------------

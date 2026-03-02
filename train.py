@@ -7,6 +7,7 @@ from src.gptv3 import GPTConfig
 from src.datamodule import PackedDataModule
 
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
@@ -14,11 +15,11 @@ if __name__ == "__main__":
     logger = WandbLogger(project="forge-trace-nanogpt")
 
     data_module = PackedDataModule(
-        train_dir="/cache/yanko/dataset/abc-optimized-sep-train/",
-        val_dir="/cache/yanko/dataset/abc-optimized-sep-val/",
+        train_dir="data/abc-optimized-sep-train/",
+        val_dir="data/abc-optimized-sep-val/",
         max_num_tokens=32768,
         batch_size=1,
-        num_workers=20,
+        num_workers=16,
     )
     config = GPTConfig(
         sequence_len=4096,
@@ -31,14 +32,22 @@ if __name__ == "__main__":
     )
     model = ForgeTrace(config)
     model = torch.compile(model)
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val/loss",
+        dirpath="checkpoint/nanochat/",
+        filename="epoch{epoch:02d}-val_loss{val/loss:.4f}",
+        auto_insert_metric_name=False,
+    )
     trainer = L.Trainer(
-        max_steps=400000,
+        max_steps=200000,
+        num_nodes=1,
         val_check_interval=2000,
         check_val_every_n_epoch=None,
-        accumulate_grad_batches=4,
+        limit_val_batches=500,
+        # accumulate_grad_batches=1,
         precision="bf16-mixed",
         model_registry="ForgeTrace",
-        # gradient_clip_val=1.0,
+        callbacks=checkpoint_callback,
         logger=logger,
         use_distributed_sampler=False,
     )
