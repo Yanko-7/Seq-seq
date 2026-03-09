@@ -146,7 +146,6 @@ def load_dataset_fast(json_path, root_dir, ext=".npz"):
 
 
 if __name__ == "__main__":
-    # 2. Generate the inputs (we are going to optimize all the compressed json files from SlimPajama dataset )
     dataset = load_dataset_fast(
         json_path="abc_filtered_final.json",
         root_dir="/cache/yanko/datasets/npz_files/organized_by_face_count/",
@@ -154,13 +153,12 @@ if __name__ == "__main__":
     inputs = [str(file) for file in dataset["train"]]
     checkpoint_dir = "../weights"
     _tokenizer = Tokenizer(checkpoint_dir)
-    # 3. Store the optimized data wherever you want under "/teamspace/datasets" or "/teamspace/s3_connections"
 
     outputs = optimize(
         fn=partial(tokenize_fn, tokenizer=_tokenizer, augment=True),
         inputs=inputs,
         output_dir="./abc-optimized-sep-train",
-        chunk_size=4096 * 8,
+        chunk_size=4096 * 16,
         # item_loader=TokensLoader(),
         num_workers=16,
     )

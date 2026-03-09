@@ -1,13 +1,13 @@
+import random
+from itertools import chain
+
+import lightning as L
+import litdata as ld
+import torch
+from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
-import torch
-import lightning as L
-from torch.utils.data import DataLoader
-from torch.utils.data import IterableDataset
-import random
-import litdata as ld
 from src.tokenizer import BRepTokenType
-from itertools import chain
 
 
 def next_multiple_of_n(v: float | int, *, n: int) -> int:
@@ -123,7 +123,7 @@ class PackedDataModule(L.LightningDataModule):
         return DataLoader(
             self.val_ds,
             batch_size=self.hparams.batch_size,
-            num_workers=max(1, self.hparams.num_workers / 2),
+            num_workers=max(1, self.hparams.num_workers // 2),
             pin_memory=True,
             collate_fn=custom_packed_collate_fn,
         )
@@ -170,11 +170,11 @@ if __name__ == "__main__":
 
     all_lengths = torch.cat(all_lengths).float() if all_lengths else torch.tensor([])
 
-    print(f"\n--- Token ID 统计 ---")
+    print("\n--- Token ID 统计 ---")
     print(f"全局最小 token id: {int(global_min_id)}")
     print(f"全局最大 token id: {int(global_max_id)}")
 
-    print(f"\n--- 序列长度统计 ---")
+    print("\n--- 序列长度统计 ---")
     if len(all_lengths) > 0:
         len_2_count = (all_lengths == 2).sum().item()
         lengths_without_2 = all_lengths[all_lengths != 2]

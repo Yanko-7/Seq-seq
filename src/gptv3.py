@@ -14,16 +14,17 @@ Notable features:
 
 from dataclasses import dataclass
 from typing import Optional
-
-import flash_attn
+from flash_attn.cute import flash_attn_varlen_func
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from src.optim import MuonAdamW
 from torch.nn.attention.flex_attention import (
     flex_attention,
 )
+from torch.nn.attention.varlen import varlen_attn
+
+from src.fla import flash_attn_func, flash_attn_with_kvcache
+from src.optim import MuonAdamW
 
 
 _compiled_flex_attention = torch.compile(flex_attention)
@@ -45,7 +46,7 @@ class GPTConfig:
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    return F.rms_norm(x, (x.size(-1),)).to(x.dtype)
 
 
 def has_ve(layer_idx, n_layer):
@@ -106,6 +107,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)  # QK norm
+
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
@@ -116,22 +118,27 @@ class CausalSelfAttention(nn.Module):
                 v = v.transpose(1, 2)
                 y = _compiled_flex_attention(q, k, v, block_mask=mask, enable_gqa=True)
                 y = y.transpose(1, 2)
-            else:
-                y = flash_attn.flash_attn_varlen_func(
+            elif cu_seqlens is not None:
+                pass
+
+                y = varlen_attn(
                     q[0],
                     k[0],
                     v[0],
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    causal=True,
+                    cu_seq_q=cu_seqlens,
+                    cu_seq_k=cu_seqlens,
+                    max_q=max_seqlen,
+                    max_k=max_seqlen,
+                    is_causal=True,
+                    # window_size=(-1, 0),
                     # window_size=window_size,
                 )
+            else:
+                y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+            y = flash_attn_with_kvcache(
                 q,
                 k_cache,
                 v_cache,
@@ -139,7 +146,7 @@ class CausalSelfAttention(nn.Module):
                 v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
-                window_size=window_size,
+                window_size=(-1, 0),
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -165,12 +172,13 @@ class MLP(nn.Module):
 
 
 class LLaMAMLP(nn.Module):
-    def __init__(self, config, intermediate_size: Optional[int] = None) -> None:
+    def __init__(self, config) -> None:
         super().__init__()
-        self.intermediate_size = intermediate_size or config.intermediate_size
-        self.fc_1 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
+        intermediate_size = int(8 * config.n_embd / 3)
+        intermediate_size = (intermediate_size + 255) // 256 * 256
+        self.fc_1 = nn.Linear(config.n_embd, intermediate_size, bias=False)
+        self.fc_2 = nn.Linear(config.n_embd, intermediate_size, bias=False)
+        self.proj = nn.Linear(intermediate_size, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.fc_1(x)
@@ -183,6 +191,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
+        # self.mlp = LLaMAMLP(config)
         self.mlp = MLP(config)
 
     def forward(
@@ -291,6 +300,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)  # projections are zero
+            # torch.nn.init.uniform_(block.mlp.fc_1.weight, -s, s)
+            # torch.nn.init.uniform_(block.mlp.fc_2.weight, -s, s)
+            # torch.nn.init.zeros_(block.mlp.proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -371,176 +383,12 @@ class GPT(nn.Module):
         window_sizes[-1] = (long_window, 0)
         return window_sizes
 
-    def get_device(self):
-        return self.transformer.wte.weight.device
-
-    def estimate_flops(self):
-        """
-        Return the estimated FLOPs per token for the model (forward + backward).
-        Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
-        Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
-        """
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (
-            self.transformer.wte.weight.numel()
-            + value_embeds_numel
-            + self.resid_lambdas.numel()
-            + self.x0_lambdas.numel()
-        )
-        h, q, t = (
-            self.config.n_head,
-            self.config.n_embd // self.config.n_head,
-            self.config.sequence_len,
-        )
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
-        return num_flops_per_token
-
-    def num_scaling_params(self):
-        """
-        Return detailed parameter counts for scaling law analysis.
-        Different papers use different conventions:
-        - Kaplan et al. excluded embedding parameters
-        - Chinchilla included all parameters
-        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
-        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
-
-        Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
-        """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), (
-            "Parameter count mismatch"
-        )
-        return {
-            "wte": wte,
-            "value_embeds": value_embeds,
-            "lm_head": lm_head,
-            "transformer_matrices": transformer_matrices,
-            "scalars": scalars,
-            "total": total,
-        }
-
-    def setup_optimizer(
-        self,
-        unembedding_lr=0.004,
-        embedding_lr=0.2,
-        matrix_lr=0.02,
-        weight_decay=0.0,
-        adam_betas=(0.8, 0.95),
-        scalar_lr=0.5,
-    ):
-        model_dim = self.config.n_embd  # 1024
-
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(
-            embedding_params
-        ) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(
-            x0_params
-        )
-
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(
-            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
-        )
-
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(
-                kind="adamw",
-                params=lm_head_params,
-                lr=unembedding_lr * dmodel_lr_scale,
-                betas=adam_betas,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=embedding_params,
-                lr=embedding_lr * dmodel_lr_scale,
-                betas=adam_betas,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=value_embeds_params,
-                lr=embedding_lr * dmodel_lr_scale,
-                betas=adam_betas,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=resid_params,
-                lr=scalar_lr * 0.01,
-                betas=adam_betas,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=x0_params,
-                lr=scalar_lr,
-                betas=(0.96, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
-            ),  # higher beta1 for x0
-        ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(
-                dict(
-                    kind="muon",
-                    params=group_params,
-                    lr=matrix_lr,
-                    momentum=0.95,
-                    ns_steps=5,
-                    beta2=0.95,
-                    weight_decay=weight_decay,
-                )
-            )
-
-        Factory = MuonAdamW
-        optimizer = Factory(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
-
     def forward(
         self,
         idx,
-        mask,
-        cu_seqlens,
-        max_seqlen,
+        mask=None,
+        cu_seqlens=None,
+        max_seqlen=None,
         targets=None,
         kv_cache=None,
         loss_reduction="mean",

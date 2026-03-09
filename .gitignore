@@ -69,3 +69,4 @@ dist/
 samples/
 
 lightning_logs/
+decodes/
