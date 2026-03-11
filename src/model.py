@@ -39,36 +39,36 @@ class ForgeTrace(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # self.num_iters = 200000
-        # optimizer = self.model.setup_optimizer(
-        #     unembedding_lr=0.002,
-        #     embedding_lr=0.1,
-        #     matrix_lr=0.01,
-        #     scalar_lr=0.25,
-        #     weight_decay=0.1,
-        # )
-        #
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=3e-4,
-            weight_decay=0.1,
-            betas=(0.9, 0.95),
+        self.num_iters = 150000
+        return self.model.setup_optimizer(
+            unembedding_lr=0.002,
+            embedding_lr=0.1,
+            matrix_lr=0.02,
+            scalar_lr=0.5,
+            weight_decay=0.2,
         )
-        scheduler = get_cosine_schedule_with_warmup(optimizer, 1500, 150000)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
-        }
+        #
+        # optimizer = torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=3e-4,
+        #     weight_decay=0.1,
+        #     betas=(0.9, 0.95),
+        # )
+        # scheduler = get_cosine_schedule_with_warmup(optimizer, 1500, 150000)
+        # return {
+        #     "optimizer": optimizer,
+        #     "lr_scheduler": {
+        #         "scheduler": scheduler,
+        #         "interval": "step",
+        #     },
+        # }
 
-    # def on_before_optimizer_step(self, optimizer):
-    #     step = self.global_step
-    #     muon_momentum = 0.95 - 0.1 * max(0.0, 1.0 - step / 500.0)
-    #     current_wd = 0.1 * max(0.0, 1.0 - step / self.num_iters)
-    #
-    #     for group in optimizer.param_groups:
-    #         if group.get("kind") == "muon":
-    #             group["momentum"] = muon_momentum
-    #             group["weight_decay"] = current_wd
+    def on_before_optimizer_step(self, optimizer):
+        step = self.global_step
+        muon_momentum = 0.95 - 0.1 * max(0.0, 1.0 - step / 500.0)
+        current_wd = 0.1 * max(0.0, 1.0 - step / self.num_iters)
+
+        for group in optimizer.param_groups:
+            if group.get("kind") == "muon":
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = current_wd

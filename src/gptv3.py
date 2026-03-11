@@ -14,7 +14,8 @@ Notable features:
 
 from dataclasses import dataclass
 from typing import Optional
-from flash_attn.cute import flash_attn_varlen_func
+
+# from flash_attn.cute import flash_attn_varlen_func
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -129,8 +130,8 @@ class CausalSelfAttention(nn.Module):
                     cu_seq_k=cu_seqlens,
                     max_q=max_seqlen,
                     max_k=max_seqlen,
-                    is_causal=True,
-                    # window_size=(-1, 0),
+                    # is_causal=True,
+                    window_size=(-1, 0),
                     # window_size=window_size,
                 )
             else:
@@ -331,6 +332,101 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+    ):
+        model_dim = self.config.n_embd  # 1024
+
+        # Separate out all parameters into groups
+        matrix_params = list(self.transformer.h.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(
+            embedding_params
+        ) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(
+            x0_params
+        )
+
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print(
+            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+        )
+
+        # Build param_groups with all required fields explicit
+        param_groups = [
+            # AdamW groups (embeddings, lm_head, scalars)
+            dict(
+                kind="adamw",
+                params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=value_embeds_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=scalar_lr * 0.01,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=scalar_lr,
+                betas=(0.96, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),  # higher beta1 for x0
+        ]
+        # Muon groups (matrix params, grouped by shape for stacking)
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(
+                dict(
+                    kind="muon",
+                    params=group_params,
+                    lr=matrix_lr,
+                    momentum=0.95,
+                    ns_steps=5,
+                    beta2=0.95,
+                    weight_decay=weight_decay,
+                )
+            )
+
+        Factory = MuonAdamW
+        optimizer = Factory(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently

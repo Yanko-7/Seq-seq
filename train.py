@@ -65,10 +65,10 @@ if __name__ == "__main__":
     trainer = L.Trainer(
         max_steps=300000,
         num_nodes=1,
-        devices=3,
+        devices=4,
         val_check_interval=1500,
         check_val_every_n_epoch=None,
-        limit_val_batches=650,
+        limit_val_batches=800,
         accumulate_grad_batches=2,
         precision="bf16-mixed",
         model_registry="ForgeTrace",
