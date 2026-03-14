@@ -1,0 +1,10 @@
+2026-03-09 13:40:49,237 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   338 占比 52.81%
+UNDEFINED_EDGE_REF       :   133 占比 20.78%
+INVALID_EDGE_VQ          :    66 占比 10.31%
+INVALID_BBOX             :    49 占比  7.66%
+INVALID_FACE_VQ          :    36 占比  5.62%
+INVALID_EDGE_ID          :    16 占比  2.50%
+DUPLICATE_EDGE_ID        :     2 占比  0.31%

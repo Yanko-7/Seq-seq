@@ -29,7 +29,7 @@ if __name__ == "__main__":
     data_module = PackedDataModule(
         train_dir="data/abc-optimized-sep-train/",
         val_dir="data/abc-optimized-sep-val/",
-        max_num_tokens=32768,
+        max_num_tokens=24576,
         batch_size=1,
         num_workers=24,
     )
@@ -37,9 +37,9 @@ if __name__ == "__main__":
         sequence_len=8192,
         vocab_size=4096,
         n_layer=30,
-        n_head=9,
-        n_kv_head=3,
-        n_embd=576,
+        n_head=12,
+        n_kv_head=4,
+        n_embd=768,
         window_pattern="SSSL",
     )
     model = ForgeTrace(config)
@@ -69,7 +69,7 @@ if __name__ == "__main__":
         val_check_interval=1500,
         check_val_every_n_epoch=None,
         limit_val_batches=650,
-        accumulate_grad_batches=2,
+        accumulate_grad_batches=3,
         precision="bf16-mixed",
         model_registry="ForgeTrace",
         logger=logger,

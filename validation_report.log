@@ -1,0 +1,91 @@
+2026-03-09 13:58:32,628 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   338 占比 52.81%
+UNDEFINED_EDGE_REF       :   133 占比 20.78%
+INVALID_EDGE_VQ          :    66 占比 10.31%
+INVALID_BBOX             :    49 占比  7.66%
+INVALID_FACE_VQ          :    36 占比  5.62%
+INVALID_EDGE_ID          :    16 占比  2.50%
+DUPLICATE_EDGE_ID        :     2 占比  0.31%
+2026-03-09 14:10:14,309 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   342 占比 53.44%
+UNDEFINED_EDGE_REF       :   135 占比 21.09%
+INVALID_EDGE_VQ          :    66 占比 10.31%
+INVALID_FACE_VQ          :    46 占比  7.19%
+INVALID_BBOX             :    41 占比  6.41%
+INVALID_EDGE_ID          :     5 占比  0.78%
+DUPLICATE_EDGE_ID        :     4 占比  0.62%
+EDGE_OUTSIDE_LOOP        :     1 占比  0.16%
+2026-03-09 15:15:23,579 - INFO - 
+📊 校验统计报告 (总计 1280 个样本):
+----------------------------------------
+SUCCESS                  :   679 占比 53.05%
+UNDEFINED_EDGE_REF       :   290 占比 22.66%
+INVALID_EDGE_VQ          :   122 占比  9.53%
+INVALID_BBOX             :    79 占比  6.17%
+INVALID_FACE_VQ          :    79 占比  6.17%
+INVALID_EDGE_ID          :    26 占比  2.03%
+DUPLICATE_EDGE_ID        :     5 占比  0.39%
+2026-03-09 21:33:06,280 - INFO - 
+📊 校验统计报告 (总计 1280 个样本):
+----------------------------------------
+SUCCESS                  :   604 占比 47.19%
+UNDEFINED_EDGE_REF       :   259 占比 20.23%
+INVALID_EDGE_VQ          :   198 占比 15.47%
+INVALID_FACE_VQ          :   116 占比  9.06%
+INVALID_BBOX             :    83 占比  6.48%
+INVALID_EDGE_ID          :    13 占比  1.02%
+DUPLICATE_EDGE_ID        :     6 占比  0.47%
+TRUNCATED_STREAM         :     1 占比  0.08%
+2026-03-10 00:27:42,324 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   300 占比 46.88%
+UNDEFINED_EDGE_REF       :   171 占比 26.72%
+INVALID_EDGE_VQ          :    65 占比 10.16%
+INVALID_FACE_VQ          :    43 占比  6.72%
+INVALID_BBOX             :    42 占比  6.56%
+INVALID_EDGE_ID          :    14 占比  2.19%
+UNEXPECTED_TOKEN         :     2 占比  0.31%
+DUPLICATE_EDGE_ID        :     2 占比  0.31%
+TRUNCATED_STREAM         :     1 占比  0.16%
+2026-03-10 11:53:46,522 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   300 占比 46.88%
+UNDEFINED_EDGE_REF       :   158 占比 24.69%
+INVALID_BBOX             :    68 占比 10.62%
+INVALID_EDGE_VQ          :    65 占比 10.16%
+INVALID_FACE_VQ          :    28 占比  4.38%
+INVALID_EDGE_ID          :    19 占比  2.97%
+DUPLICATE_EDGE_ID        :     2 占比  0.31%
+2026-03-10 12:11:13,960 - INFO - 
+📊 校验统计报告 (总计 640 个样本):
+----------------------------------------
+SUCCESS                  :   348 占比 54.37%
+INVALID_EDGE_VQ          :   103 占比 16.09%
+UNDEFINED_EDGE_REF       :    77 占比 12.03%
+INVALID_BBOX             :    61 占比  9.53%
+INVALID_FACE_VQ          :    35 占比  5.47%
+INVALID_EDGE_ID          :    16 占比  2.50%
+📊 校验统计报告 (总计 320 个样本):best-step015000-val_loss0.2159.ckpt
+----------------------------------------
+SUCCESS                  :   154 占比 48.12%
+UNDEFINED_EDGE_REF       :    86 占比 26.88%
+INVALID_EDGE_VQ          :    36 占比 11.25%
+INVALID_BBOX             :    21 占比  6.56%
+INVALID_FACE_VQ          :    19 占比  5.94%
+INVALID_EDGE_ID          :     4 占比  1.25%
+
+📊 校验统计报告 (总计 320 个样本):latest-step060000.ckpt
+----------------------------------------
+SUCCESS                  :   172 占比 53.75%
+UNDEFINED_EDGE_REF       :    45 占比 14.06%
+INVALID_EDGE_VQ          :    44 占比 13.75%
+INVALID_BBOX             :    34 占比 10.62%
+INVALID_FACE_VQ          :    18 占比  5.62%
+INVALID_EDGE_ID          :     6 占比  1.88%
+NESTED_LOOP              :     1 占比  0.31%

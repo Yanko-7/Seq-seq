@@ -13,8 +13,6 @@ Notable features:
 """
 
 from dataclasses import dataclass
-from typing import Optional
-from flash_attn.cute import flash_attn_varlen_func
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,8 +21,9 @@ from torch.nn.attention.flex_attention import (
 )
 from torch.nn.attention.varlen import varlen_attn
 
+from src.common import get_dist_info, print0
 from src.fla import flash_attn_func, flash_attn_with_kvcache
-from src.optim import MuonAdamW
+from src.optim import DistMuonAdamW, MuonAdamW
 
 
 _compiled_flex_attention = torch.compile(flex_attention)
@@ -382,6 +381,101 @@ class GPT(nn.Module):
         # Final layer always gets full context
         window_sizes[-1] = (long_window, 0)
         return window_sizes
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        scalar_lr=0.5,
+    ):
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+
+        # Separate out all parameters into groups
+        matrix_params = list(self.transformer.h.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(
+            embedding_params
+        ) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(
+            x0_params
+        )
+
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print0(
+            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+        )
+
+        # Build param_groups with all required fields explicit
+        param_groups = [
+            # AdamW groups (embeddings, lm_head, scalars)
+            dict(
+                kind="adamw",
+                params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.96),
+                eps=1e-10,
+                weight_decay=0.01,
+            ),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.995),
+                eps=1e-10,
+                weight_decay=0.001,
+            ),
+            dict(
+                kind="adamw",
+                params=value_embeds_params,
+                lr=embedding_lr * dmodel_lr_scale * 0.5,
+                betas=(0.8, 0.995),
+                eps=1e-10,
+                weight_decay=0.01,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=scalar_lr * 0.01,
+                betas=(0.8, 0.95),
+                eps=1e-10,
+                weight_decay=0.05,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=scalar_lr,
+                betas=(0.96, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),  # higher beta1 for x0
+        ]
+        # Muon groups (matrix params, grouped by shape for stacking)
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(
+                dict(
+                    kind="muon",
+                    params=group_params,
+                    lr=matrix_lr,
+                    momentum=0.95,
+                    ns_steps=5,
+                    beta2=0.9,
+                    weight_decay=weight_decay,
+                )
+            )
+
+        Factory = DistMuonAdamW if ddp else MuonAdamW
+        optimizer = Factory(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
 
     def forward(
         self,

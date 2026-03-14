@@ -756,23 +756,18 @@ class Tokenizer(torch.nn.Module):
         edge_bboxes, edge_vqs = [], []
         active_edges = {}
 
-        outer_edge_indices = []
-        face_outer_offsets = [0]
-        inner_edge_indices = []
-        inner_loop_offsets = [0]
-        face_inner_offsets = [0]
+        outer_edge_indices, face_outer_offsets = [], [0]
+        inner_edge_indices, inner_loop_offsets, face_inner_offsets = [], [0], [0]
 
-        idx = 0
-        in_face = False
-        loop_idx_in_face = 0
+        idx, in_face, loop_idx_in_face = 0, False, 0
 
         while idx < len(tokens):
             tok = tokens[idx]
 
-            if tok in (BRepTokenType.BOS, BRepTokenType.PAD):
+            if tok in (self.bos_id, self.pad_id):
                 idx += 1
                 continue
-            elif tok == BRepTokenType.EOS:
+            elif tok == self.eos_id:
                 break
 
             if tok == BRepTokenType.FACE_START:
@@ -782,22 +777,19 @@ class Tokenizer(torch.nn.Module):
                 bbox, face_vqs_tokens, idx = self._parse_face_tokens(tokens, idx)
                 face_bboxes.append(bbox)
                 face_vqs.append(face_vqs_tokens)
-
-                in_face = True
-                loop_idx_in_face = 0
+                in_face, loop_idx_in_face = True, 0
 
             elif tok == BRepTokenType.FACE_END:
                 if not in_face:
-                    raise ValueError(f"FACE_END without FACE_START at index {idx}.")
+                    raise ValueError(f"FACE_END without FACE_START at {idx}.")
 
                 face_outer_offsets.append(len(outer_edge_indices))
                 face_inner_offsets.append(len(inner_loop_offsets) - 1)
-                in_face = False
-                idx += 1
+                in_face, idx = False, idx + 1
 
             elif tok == BRepTokenType.LOOP_START:
                 if not in_face:
-                    raise ValueError(f"LOOP_START outside of face at index {idx}.")
+                    raise ValueError(f"LOOP_START outside of face at {idx}.")
 
                 idx += 1
                 current_loop = []
@@ -817,27 +809,30 @@ class Tokenizer(torch.nn.Module):
                         active_edges[edge_id] = canonical_idx
                         current_loop.append(canonical_idx)
 
-                    elif ltok == BRepTokenType.EDGE_REF:
+                    elif ltok in (BRepTokenType.EDGE_REF, BRepTokenType.EDGE_REF_LAST):
                         if idx + 2 > len(tokens):
-                            raise ValueError("Truncated token stream after EDGE_REF.")
+                            raise ValueError(
+                                f"Truncated token stream after {BRepTokenType(ltok).name}."
+                            )
 
                         edge_id = tokens[idx + 1]
                         if edge_id not in active_edges:
                             raise ValueError(
-                                f"Invalid EDGE_REF {edge_id} at index {idx}."
+                                f"Invalid {BRepTokenType(ltok).name} {edge_id} at {idx}."
                             )
 
-                        canonical_idx = active_edges.pop(edge_id)
+                        if ltok == BRepTokenType.EDGE_REF_LAST:
+                            canonical_idx = active_edges.pop(edge_id)
+                        else:
+                            canonical_idx = active_edges[edge_id]
+
                         current_loop.append(canonical_idx)
                         idx += 2
                     else:
-                        raise ValueError(
-                            f"Invalid token {ltok} inside loop at index {idx}."
-                        )
+                        raise ValueError(f"Invalid token {ltok} inside loop at {idx}.")
 
                 if idx >= len(tokens) or tokens[idx] != BRepTokenType.LOOP_END:
                     raise ValueError("Unterminated LOOP_START.")
-
                 idx += 1
 
                 if loop_idx_in_face == 0:
@@ -845,7 +840,6 @@ class Tokenizer(torch.nn.Module):
                 else:
                     inner_edge_indices.extend(current_loop)
                     inner_loop_offsets.append(len(inner_edge_indices))
-
                 loop_idx_in_face += 1
 
             else:
@@ -854,7 +848,6 @@ class Tokenizer(torch.nn.Module):
         if in_face:
             raise ValueError("Sequence ended with an unclosed FACE_START.")
 
-        # VQ-VAE Geometric Decoding
         face_points, edge_points = [], []
 
         if face_vqs:
@@ -872,9 +865,7 @@ class Tokenizer(torch.nn.Module):
                 edge_points.append(denormalize_points_with_bbox(pts, bbox))
 
         if face_points is None or edge_points is None:
-            raise ValueError(
-                "face_points or edge_points is None after decoding, cannot proceed."
-            )
+            raise ValueError("face_points or edge_points is None after decoding.")
 
         return BRepData(
             face_points=np.array(face_points, dtype=np.float32),
